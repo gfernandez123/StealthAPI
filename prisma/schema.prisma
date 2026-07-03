@@ -1,0 +1,173 @@
+// Prisma schema for StealthAPI — receivables verification infrastructure for trade finance lenders.
+// docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AccountingProvider {
+  QUICKBOOKS
+  XERO
+}
+
+enum ConnectionStatus {
+  PENDING
+  ACTIVE
+  ERROR
+  REVOKED
+}
+
+enum InvoiceStatus {
+  OPEN
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+}
+
+// A lender / factoring company — the paying customer of the API.
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys   ApiKey[]
+  borrowers Borrower[]
+}
+
+model ApiKey {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  // Only the hash is stored; the plaintext key is shown once at creation time.
+  hashedKey  String   @unique
+  keyPrefix  String
+  label      String?
+  createdAt  DateTime @default(now())
+  revokedAt  DateTime?
+
+  @@index([organizationId])
+}
+
+// A business being evaluated/financed by a lender.
+model Borrower {
+  id             String       @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  legalName String
+  externalRef String? // the lender's own identifier for this borrower, if any
+
+  // Plaid covers bank connectivity independently of which accounting system
+  // (if any) is connected, so it lives directly on Borrower rather than in
+  // the AccountingProvider-scoped Connection model below.
+  plaidItemId        String?
+  plaidAccessTokenEnc String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  connections        Connection[]
+  invoices           Invoice[]
+  payments           Payment[]
+  authenticityScores AuthenticityScore[]
+
+  @@index([organizationId])
+}
+
+// A single OAuth-linked accounting connection for a borrower (QuickBooks or Xero).
+model Connection {
+  id         String             @id @default(cuid())
+  borrowerId String
+  borrower   Borrower           @relation(fields: [borrowerId], references: [id], onDelete: Cascade)
+
+  provider   AccountingProvider
+  status     ConnectionStatus   @default(PENDING)
+
+  // Provider-side identifiers
+  realmId    String?            // QuickBooks company (realm) ID
+  tenantId   String?            // Xero tenant ID
+
+  // Encrypted at the application layer before being written to the DB — see lib/crypto.ts
+  accessTokenEnc  String?
+  refreshTokenEnc String?
+  tokenExpiresAt  DateTime?
+
+  lastSyncedAt DateTime?
+  lastError    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([borrowerId])
+  @@unique([borrowerId, provider])
+}
+
+// A normalized invoice, regardless of source accounting system.
+model Invoice {
+  id         String   @id @default(cuid())
+  borrowerId String
+  borrower   Borrower @relation(fields: [borrowerId], references: [id], onDelete: Cascade)
+
+  provider           AccountingProvider
+  sourceId           String // the invoice ID in QuickBooks/Xero
+  customerName       String // the borrower's own customer (the debtor)
+  amount             Decimal  @db.Decimal(14, 2)
+  amountPaid         Decimal  @db.Decimal(14, 2) @default(0)
+  currency           String   @default("USD")
+  issueDate          DateTime
+  dueDate            DateTime
+  status             InvoiceStatus
+
+  syncedAt DateTime @default(now())
+
+  payments           Payment[]
+  authenticityScore  AuthenticityScore?
+
+  @@index([borrowerId])
+  @@unique([borrowerId, provider, sourceId])
+}
+
+// A payment/transaction matched against an invoice, sourced from the accounting
+// system's own records and/or cross-referenced bank transaction data (via Plaid).
+model Payment {
+  id         String   @id @default(cuid())
+  borrowerId String
+  borrower   Borrower @relation(fields: [borrowerId], references: [id], onDelete: Cascade)
+  invoiceId  String?
+  invoice    Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  amount       Decimal  @db.Decimal(14, 2)
+  paidAt       DateTime
+  source       String   // "accounting_system" | "plaid_bank_match"
+  matchedByFuzzy Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([borrowerId])
+  @@index([invoiceId])
+}
+
+// A computed confidence score indicating how well an invoice's existence/payment
+// history has been corroborated by independent data (bank transactions today;
+// cross-lender registry checks in a later phase).
+model AuthenticityScore {
+  id        String  @id @default(cuid())
+  invoiceId String  @unique
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  borrowerId String
+  borrower  Borrower @relation(fields: [borrowerId], references: [id], onDelete: Cascade)
+
+  score      Int      // 0-100
+  reasons    Json      // structured list of signals that produced the score
+  computedAt DateTime @default(now())
+
+  @@index([borrowerId])
+}
